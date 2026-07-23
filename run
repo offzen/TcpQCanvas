@@ -1,0 +1,969 @@
+#!/bin/sh
+#
+# TcpQuality Canvas 持续滚动监控监测脚本 v1.2.5 (部分重构版--计入首包数据）
+# 重首次连接的体验而不是线路的物理质量 普通线路的丢包数会提高 是预期之中的
+# 此时应该更重视httping数据
+# 参数: [-v4] [-v6] [-bj] [-gd] -t 0 (省份缩写/运行时间/0为永续看盘)
+#######
+# 基于TcpQuality代码修改并使用其API。鸣谢！
+# https://github.com/ibsgss/TcpQuality
+######
+# POSIX Bootstrap 自拉起引擎
+if [ -z "$BASH_VERSION" ]; then
+  if ! command -v bash >/dev/null 2>&1; then
+    echo "[i] 检测到 Alpine/精简系统缺失 Bash，正在自动补齐环境..."
+    if command -v apk >/dev/null 2>&1; then
+      apk add --no-cache bash netcat-openbsd curl gawk traceroute >/dev/null 2>&1
+    elif command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -yqq bash netcat-openbsd >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y epel-release >/dev/null 2>&1 || true
+      yum install -yq bash nc >/dev/null 2>&1
+    fi
+  fi
+  if command -v bash >/dev/null 2>&1; then
+    exec bash "$0" "$@"
+  else
+    echo "[X] 错误: 无法自动配置 Bash 环境，请手动安装后重试"
+    exit 1
+  fi
+fi
+
+# ===================== 进入标准 Bash 运行环境 =====================
+set +e
+
+DEFAULT_PORT="80"
+MAX_PREWARM_JOBS=10
+PING_INTERVAL=3
+MAX_NODE_INTERVAL=8
+PACING_ADDER=0
+
+NC_SUPPORTS_FAMILY_FLAGS=1
+DETECTED_CPU_CORES=1
+
+RED=$'\033[0;31m';    GREEN=$'\033[0;32m';    YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;34m';   CYAN=$'\033[0;36m';     MAGENTA=$'\033[0;35m'
+WHITE=$'\033[1;37m';  BOLD=$'\033[1m';        DIM=$'\033[2m'
+NC=$'\033[0m';        EL=$'\033[K';           ED=$'\033[J'
+CLEAR=$'\033[H\033[J';CURSOR_HOME=$'\033[H'
+
+detect_hardware_basics() {
+  DETECTED_CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+}
+
+check_and_install_deps() {
+  local cmds=("curl" "nc" "awk" "httping" "traceroute")
+  local missing=()
+  for cmd in "${cmds[@]}"; do
+    if ! command -v "$cmd" &>/dev/null; then missing+=("$cmd"); fi
+  done
+
+  if command -v ncat &>/dev/null && ! command -v nc &>/dev/null; then
+    alias nc=ncat 2>/dev/null || true
+    missing=("${missing[@]/nc/}")
+  fi
+
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo -e "${YELLOW}[i] 检测到缺失组件: ${missing[*]}，正在为您自动拉取安装...${NC}"
+    if command -v apk &>/dev/null; then
+      local apk_pkgs=""
+      for m in "${missing[@]}"; do
+        case "$m" in
+          nc) apk_pkgs+=" netcat-openbsd" ;;
+          httping) apk_pkgs+=" httping" ;;
+          traceroute) apk_pkgs+=" traceroute" ;;
+          awk) apk_pkgs+=" gawk" ;;
+          curl) apk_pkgs+=" curl" ;;
+        esac
+      done
+      apk add -q --no-cache $apk_pkgs >/dev/null 2>&1
+    elif command -v apt-get &>/dev/null; then
+      apt-get update -qq
+      local apt_pkgs=""
+      for m in "${missing[@]}"; do
+        case "$m" in
+          nc) apt_pkgs+=" netcat-openbsd" ;;
+          httping) apt_pkgs+=" httping" ;;
+          traceroute) apt_pkgs+=" traceroute" ;;
+          awk) apt_pkgs+=" gawk" ;;
+          curl) apt_pkgs+=" curl" ;;
+        esac
+      done
+      DEBIAN_FRONTEND=noninteractive apt-get install -yqq $apt_pkgs >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+      local yum_pkgs=""
+      for m in "${missing[@]}"; do
+        case "$m" in
+          nc) yum_pkgs+=" nc" ;;
+          httping) yum_pkgs+=" httping" ;;
+          traceroute) yum_pkgs+=" traceroute" ;;
+          awk) yum_pkgs+=" gawk" ;;
+          curl) yum_pkgs+=" curl" ;;
+        esac
+      done
+      yum install -y epel-release >/dev/null 2>&1 || true
+      yum install -yq $yum_pkgs >/dev/null 2>&1
+    fi
+  fi
+
+  if command -v nc &>/dev/null; then
+    local test_nc=$(nc -h 2>&1 || true)
+    if echo "$test_nc" | grep -iq "BusyBox"; then
+      if command -v apk &>/dev/null; then apk add -q --no-cache netcat-openbsd >/dev/null 2>&1 || true; fi
+    fi
+    local test_family=$(nc -4 -h 2>&1 || true)
+    if echo "$test_family" | grep -iqE "invalid option|unrecognized option"; then
+      if command -v apt-get &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -yqq netcat-openbsd >/dev/null 2>&1 || true
+        update-alternatives --set nc /bin/nc.openbsd >/dev/null 2>&1 || true
+      fi
+      test_family=$(nc -4 -h 2>&1 || true)
+      if echo "$test_family" | grep -iqE "invalid option|unrecognized option"; then NC_SUPPORTS_FAMILY_FLAGS=0; else NC_SUPPORTS_FAMILY_FLAGS=1; fi
+    else NC_SUPPORTS_FAMILY_FLAGS=1; fi
+  fi
+  echo -e "${GREEN}[√] 依赖环境与全系统兼容性校验完成！${NC}\n"
+}
+
+is_nixos() { [ -e /etc/NIXOS ] || { [ -r /etc/os-release ] && grep -Eq '^ID=(nixos|"nixos")$' /etc/os-release; }; }
+bootstrap_nixos_environment() {
+  local temp_script; local -a nix_packages
+  is_nixos || return 0
+  [ "${TCPQUALITY_NIX_BOOTSTRAPPED:-0}" -eq 1 ] && return 0
+  if ! command -v nix >/dev/null 2>&1; then exit 1; fi
+  temp_script=$(mktemp /tmp/tcpquality-canvas.XXXXXX.sh)
+  cat "$0" > "$temp_script"; chmod 0755 "$temp_script"; trap 'rm -f -- "$temp_script"' EXIT
+  nix_packages=(nixpkgs#bash nixpkgs#coreutils nixpkgs#curl nixpkgs#findutils nixpkgs#gawk nixpkgs#gnugrep nixpkgs#gnused nixpkgs#iproute2 nixpkgs#iputils nixpkgs#jq nixpkgs#kmod nixpkgs#ncurses nixpkgs#traceroute)
+  exec env TCPQUALITY_NIX_BOOTSTRAPPED=1 TCPQUALITY_NIX_TEMP_SCRIPT="$temp_script" NIXPKGS_ALLOW_UNFREE=1 nix --extra-experimental-features 'nix-command flakes' shell --impure "${nix_packages[@]}" --command bash "$temp_script" "$@"
+}
+bootstrap_nixos_environment "$@"
+
+ONLY_IPV4=0; ONLY_IPV6=0
+TOTAL_TIMEOUT=120
+SELECTED_PROVINCES=""
+
+IPV4_WORK=0; IPV6_WORK=0
+GET_NODES_URL="${GET_NODES_URL:-https://tcpquality.ibsgss.uk/getNodes}"
+REMOTE_CDN4_NODES=()
+REMOTE_CDN6_NODES=()
+
+if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then RESULT_DIR=$(mktemp -d /dev/shm/tcpquality_debug_XXXXXX)
+else RESULT_DIR=$(mktemp -d /tmp/tcpquality_debug_XXXXXX); fi
+LAST_VIEW_MODE=""
+
+detect_ip_stack() {
+  local has_v4_route=0; local has_v6_route=0
+  if command -v ip &>/dev/null; then
+    if ip route show default 2>/dev/null | grep -q "dev"; then has_v4_route=1; fi
+    if ip -6 route show default 2>/dev/null | grep -q "dev"; then has_v6_route=1; fi
+  fi
+  if [ "$has_v4_route" -eq 1 ] || curl -s4 --connect-timeout 2 https://www.cloudflare.com >/dev/null 2>&1; then IPV4_WORK=1; else IPV4_WORK=0; fi
+  if [ "$has_v6_route" -eq 1 ] || curl -s6 --connect-timeout 2 https://www.cloudflare.com >/dev/null 2>&1; then IPV6_WORK=1; else IPV6_WORK=0; fi
+}
+ipv4_available() { [ "$IPV4_WORK" -eq 1 ]; }
+ipv6_available() { [ "$IPV6_WORK" -eq 1 ]; }
+
+province_from_code() {
+  local code=$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^-//')
+  case "$code" in
+    he|河北) echo "河北" ;; sx|山西) echo "山西" ;; ln|辽宁) echo "辽宁" ;; jl|吉林) echo "吉林" ;;
+    hl|黑龙江) echo "黑龙江" ;; js|江苏) echo "江苏" ;; zj|浙江) echo "浙江" ;; ah|安徽) echo "安徽" ;;
+    fj|福建) echo "福建" ;; jx|江西) echo "江西" ;; sd|山东) echo "山东" ;; ha|河南) echo "河南" ;;
+    hb|湖北) echo "湖北" ;; hn|湖南) echo "湖南" ;; gd|广东) echo "广东" ;; hi|海南) echo "海南" ;;
+    sc|四川) echo "四川" ;; gz|贵州) echo "贵州" ;; yn|云南) echo "云南" ;; sn|陕西) echo "陕西" ;;
+    gs|甘肃) echo "甘肃" ;; qh|青海) echo "青海" ;; nm|内蒙古) echo "内蒙古" ;; gx|广西) echo "广西" ;;
+    xz|西藏) echo "西藏" ;; nx|宁夏) echo "宁夏" ;; xj|新疆) echo "新疆" ;; bj|北京) echo "北京" ;;
+    tj|天津) echo "天津" ;; sh|上海) echo "上海" ;; cq|重庆) echo "重庆" ;; *) return 1 ;;
+  esac
+}
+add_province_filter() { local province=$(province_from_code "$1") || return 1; case "$SELECTED_PROVINCES" in *"|$province|"*) ;; *) SELECTED_PROVINCES="${SELECTED_PROVINCES}|${province}|" ;; esac; }
+province_selected() { [ -z "$SELECTED_PROVINCES" ] || [[ "$SELECTED_PROVINCES" == *"|$1|"* ]]; }
+
+load_remote_nodes() {
+  local tmp=$(mktemp); local sep="?"; [[ "$GET_NODES_URL" == *"?"* ]] && sep="&"
+  if ! curl -fsSL --connect-timeout 8 --max-time 30 "${GET_NODES_URL}${sep}format=tsv" > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  while IFS=$'\t' read -r type family prov isp host ip port target backup_host backup_ip backup_port rest; do
+    [ "$type" = "type" ] || [ -z "$ip" ] && continue
+    case "$family" in
+      4) REMOTE_CDN4_NODES+=("$prov|$isp|$host|$ip|${port:-80}|$backup_host|$backup_ip|${backup_port:-80}") ;;
+      6) REMOTE_CDN6_NODES+=("$prov|$isp|$host|$ip|${port:-80}|$backup_host|$backup_ip|${backup_port:-80}") ;;
+    esac
+  done < "$tmp"; rm -f "$tmp"; return 0
+}
+
+extract_trace_ips() { awk '/^#/ || /^target/ || /^traceroute/ { next } { for (i = 1; i <= NF; i++) { field = $i; gsub(/[^0-9A-Fa-f:.%]/, " ", field); count = split(field, tokens, /[[:space:]]+/); for (j = 1; j <= count; j++) { token = tokens[j]; sub(/%.*/, "", token); if (token ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || token ~ /:/) print token } } }' "$1"; }
+query_cymru_asn() { local req_file=$(mktemp); { echo "begin"; echo "verbose"; sort -u "$1"; echo "end"; } > "$req_file"; bash -c 'exec 3<>/dev/tcp/whois.cymru.com/43; cat "$1" >&3; cat <&3' _ "$req_file" > "$2" 2>/dev/null || true; rm -f "$req_file"; }
+build_asn_map() { awk -F'|' 'NR == 1 { next } { asn = $1; ip = $2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", asn); gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip); if (asn ~ /^[0-9]+$/) print ip "|" asn }' "$1" > "$2"; }
+route_label_from_ip_trace() {
+  awk -F'|' '
+    function infer_asn(ip) {
+      if (ip ~ /^59\.43\./) return "4809"; if (ip ~ /^202\.97\./ || ip ~ /^202\.96\./) return "4134"
+      if (ip ~ /^219\.158\./) return "4837"; if (ip ~ /^221\.183\./) return "9808"
+      if (ip ~ /^103\.214\./) return "10099"; if (ip ~ /^210\.14\./) return "9929"
+      return ""
+    }
+    FILENAME == ARGV[1] { asn_by_ip[$1] = $2; next }
+    FILENAME == ARGV[2] { ip = $0; if (seen_ip[ip]++) next; asn = asn_by_ip[ip]; if (asn == "") asn = infer_asn(ip); max_hop++; asns[max_hop] = asn; next }
+    END {
+      has_4809=0; has_9929=0; has_10099=0; has_58807=0; has_4837=0; has_9808=0; has_4134=0;
+      for (h = 1; h <= max_hop; h++) {
+        if (asns[h] == "4809") has_4809 = 1; if (asns[h] == "9929") has_9929 = 1
+        if (asns[h] == "10099") has_10099 = 1; if (asns[h] == "58807") has_58807 = 1
+        if (asns[h] == "4837") has_4837 = 1; if (asns[h] == "9808" || asns[h] == "58453") has_9808 = 1
+        if (asns[h] == "4134") has_4134 = 1
+      }
+      if (has_4809)  { print "CN2GIA"; exit }; if (has_9929)  { print "9929"; exit }
+      if (has_10099) { print "10099"; exit }; if (has_58807) { print "CMIN2"; exit }
+      if (has_4837)  { print "4837"; exit };  if (has_9808)  { print "CMI"; exit }
+      if (has_4134)  { print "163"; exit }
+      print "普通三网"
+    }
+  ' "$2" "$3" "$1"
+}
+
+route_trace_one() {
+  local family="$1" proto="$2" prov="$3" isp="$4" host="$5" idx="$6" port="$7" ip="$8" prefix="$9"
+  local outfile="${RESULT_DIR}/${prefix}_${idx}"; local trace_file="${RESULT_DIR}/${prefix}_trace_${idx}"
+  if [ -z "$ip" ] || [ "$ip" = "0" ]; then echo "FAIL|$family|$prov|$isp|$proto|$host|NO_IP" > "$outfile"; return; fi
+  local -a args=(-n "-${family}" -T -p "$7" -q 1 -w 1 -m 20 "$ip" 44)
+  local output=$(traceroute "${args[@]}" 2>&1 || true)
+  { printf "# %s|%s\n" "$prov" "$isp"; echo "$output"; } > "$trace_file"
+  if extract_trace_ips "$trace_file" | grep -q .; then echo "TRACE|$family|$prov|$isp|$proto|$host|$idx" > "$outfile"; else echo "FAIL|$family|$prov|$isp|$proto|$host|TIMEOUT" > "$outfile"; fi
+}
+
+run_bg_route_detection() {
+  local idx=0; local r_raw="$RESULT_DIR/r_raw.txt"; local ip_f="$RESULT_DIR/r_ips.txt"; local cym_f="$RESULT_DIR/r_cym.txt"; local amap_f="$RESULT_DIR/r_amap.txt"
+  for node_entry in "${POLL_QUEUE[@]}"; do
+    IFS='|' read -r family prov isp host fixed_ip port <<< "$node_entry"
+    idx=$((idx + 1))
+    while [ "$(jobs -pr | wc -l | tr -cd '0-9')" -ge 4 ]; do sleep 0.4; done
+    route_trace_one "$family" "tcp" "$prov" "$isp" "$host" "$idx" "$port" "$fixed_ip" "bgroute" &
+  done; wait
+  for i in $(seq 1 "$idx"); do
+    [ -f "${RESULT_DIR}/bgroute_${i}" ] && cat "${RESULT_DIR}/bgroute_${i}" >> "$r_raw"
+    [ -f "${RESULT_DIR}/bgroute_trace_${i}" ] && extract_trace_ips "${RESULT_DIR}/bgroute_trace_${i}" >> "$ip_f"
+  done; sort -u "$ip_f" -o "$ip_f" 2>/dev/null || true
+  if [ -s "$ip_f" ]; then query_cymru_asn "$ip_f" "$cym_f"; build_asn_map "$cym_f" "$amap_f"; fi
+  if [ -f "$r_raw" ]; then
+    while IFS='|' read -r status family prov isp protocol host value; do
+      if [ -f "$RESULT_DIR" ] || [ -d "$RESULT_DIR" ]; then
+        if [ "$status" = "TRACE" ] && [ -f "${RESULT_DIR}/bgroute_trace_${value}" ]; then
+          extract_trace_ips "${RESULT_DIR}/bgroute_trace_${value}" > "${RESULT_DIR}/bgroute_trace_${value}.ips"
+          local label=$(route_label_from_ip_trace "${RESULT_DIR}/bgroute_trace_${value}" "$amap_f" "${RESULT_DIR}/bgroute_trace_${value}.ips" "$isp")
+          echo "OK|$family|$prov|$isp|tcp|$host|$label" >> "$RESULT_DIR/route_map.txt"
+        else echo "FAIL|$family|$prov|$isp|tcp|$host|普通线路" >> "$RESULT_DIR/route_map.txt"; fi
+      fi
+    done < "$r_raw"
+  fi; rm -f "$r_raw" "$ip_f" "$cym_f" "$amap_f" 2>/dev/null || true
+}
+
+# 🌟 改进方案二：将 L7 诊断结果(角标)注入到主看板中
+show_provider_summary() {
+  local file="$1"; local route_file="${2:-/dev/null}"; local target_fam="${3:-4}"; local httping_file="${4:-/dev/null}"
+  
+  green="$GREEN" yellow="$YELLOW" red="$RED" cyan="$CYAN" white="$WHITE" dim="$DIM" bold="$BOLD" magenta="$MAGENTA" nc="$NC" el="$EL" tfam="$target_fam" awk -F'|' '
+  BEGIN { 
+    g_len = length("国"); 
+    green=ENVIRON["green"]; yellow=ENVIRON["yellow"]; red=ENVIRON["red"]; 
+    cyan=ENVIRON["cyan"]; white=ENVIRON["white"]; dim=ENVIRON["dim"]; 
+    bold=ENVIRON["bold"]; magenta=ENVIRON["magenta"]; nc=ENVIRON["nc"]; el=ENVIRON["el"]; tfam=ENVIRON["tfam"];
+  }
+  function pad_custom(text, total_w,   w, i, c, pad) {
+    w = 0; for (i = 1; i <= length(text); i++) { c = substr(text, i, 1); if (c ~ /[^\x00-\x7f]/) { w += (g_len == 1) ? 2 : 2/3; } else { w += 1; } }
+    w = int(w + 0.5); pad = total_w - w; if (pad < 0) pad = 0; return text sprintf("%*s", pad, "");
+  }
+  function format_summary_cell(label, latency, loss, sent, lat_c, loss_c, tag) {
+    # tag 占用 5 个视觉列宽: " [" + emoji + "]"
+    tag_str = tag ? " [" tag "]" : "     ";
+    return white pad_custom(label, 10) nc " " lat_c sprintf("%-7s", latency) nc " " loss_c sprintf("%-7s", loss) nc " " dim sprintf("(%-4d)", sent) nc tag_str;
+  }
+  function get_cell(p, i,   val) {
+    val = data[p SUBSEP i]; if (val == "") return format_summary_cell("", "  -  ", "  -  ", 0, dim, dim, ""); return val;
+  }
+  
+  # 优先读取 httping L7 数据，提取 Emoji 标签
+  FILENAME == ARGV[1] && NF >= 8 {
+      fam = $1; prov = $2; raw_isp = $3; sub(/\(.*/, "", raw_isp);
+      l7_tags[fam SUBSEP prov SUBSEP raw_isp] = $9;
+      next;
+  }
+  
+  # 读取路由数据
+  FILENAME == ARGV[2] && NF >= 7 { 
+    if ($2 == tfam) { if ($1 == "OK") route[$3 SUBSEP $4] = $7; else route[$3 SUBSEP $4] = ""; } next 
+  }
+  
+  # 读取 L4 大盘数据
+  {
+    fam=$1; prov=$2; isp=$3; host=$4; ip=$5; sent=$6; rcvd=$7; lat_sum=$8;
+    if (fam != tfam) next;
+    label = ((prov SUBSEP isp) in route) ? route[prov SUBSEP isp] : "";
+    if (!(prov in seen)) { seen[prov] = 1; order[++n] = prov; }
+    
+    tag = l7_tags[fam SUBSEP prov SUBSEP isp];
+    
+    if (sent == 0) {
+      data[prov SUBSEP isp] = format_summary_cell(label, "  -  ", "  -  ", 0, dim, dim, tag);
+    } else {
+      loss = (sent - rcvd) * 100 / sent; loss_text = sprintf("%.2f%%", loss);
+      lc = (loss > 20)?red:((loss > 0)?yellow:green);
+      if (rcvd > 0) {
+        lat = lat_sum / rcvd; 
+        if (lat >= 1000) {
+          lat_text = sprintf("%.0fms*", lat); ptc = magenta;
+        } else {
+          lat_text = sprintf("%.0fms", lat);
+          ptc = (lat > 240)?red:((lat > 150)?yellow:green);
+        }
+      } else { lat_text = "failed"; ptc = red; }
+      data[prov SUBSEP isp] = format_summary_cell(label, lat_text, loss_text, sent, ptc, lc, tag);
+    }
+  }
+  END {
+    # 增加每列宽至 38，以适应角标
+    c1 = sprintf("%17s%s%17s", "", "电信", ""); c2 = sprintf("%17s%s%17s", "", "联通", ""); c3 = sprintf("%17s%s%17s", "", "移动", "");
+    printf "  %s%s%s%s  %s / %s / %s%s\n", bold, cyan, pad_custom("三网看板", 12), nc, cyan c1 nc, cyan c2 nc, cyan c3 nc, el
+    for (i = 1; i <= n; i++) { 
+      prov = order[i]; if (prov == "") continue;
+      printf "  %s%s%s  %s / %s / %s%s\n", cyan, pad_custom(prov, 12), nc, get_cell(prov, "电信"), get_cell(prov, "联通"), get_cell(prov, "移动"), el;
+    }
+    printf "  %s颜色: %s正常(<=150ms)%s  %s151-240ms或有轻微丢包%s  %s>240ms或重度丢包%s  %s*(看右侧角标与下表诊断详情)%s%s\n\n", dim, green, dim, yellow, dim, red, dim, magenta, dim, el
+  }' "$httping_file" "$route_file" "$file"
+}
+
+show_family_results() {
+  fam="$1" tfam="$3" bold="$BOLD" cyan="$CYAN" green="$GREEN" yellow="$YELLOW" red="$RED" nc="$NC" awk -F'|' '
+  BEGIN { 
+    z=0; y=0; h=0; 
+    bold=ENVIRON["bold"]; cyan=ENVIRON["cyan"]; green=ENVIRON["green"]; 
+    yellow=ENVIRON["yellow"]; red=ENVIRON["red"]; nc=ENVIRON["nc"];
+  } 
+  {
+    if ($1 != ENVIRON["tfam"]) next; sent=$6; rcvd=$7;
+    if (sent == 0) { next; }
+    loss = (sent - rcvd) * 100 / sent;
+    if (rcvd > 0 && loss > 20) h++; else if (rcvd == 0) h++; else if (loss == 0) z++; else y++;
+  } 
+  END { printf "  %s%s%s 统计摘要%s  %s零丢包: %d%s    %s1-20%%: %d%s    %s>20%%: %d%s\033[K\n\n", bold, cyan, ENVIRON["fam"], nc, green, z, nc, yellow, y, nc, red, h, nc }' "$2"
+  
+  local f_num="4"; if [ "$1" = "IPv6" ]; then f_num="6"; fi
+  show_provider_summary "$2" "$4" "$f_num" "$5"
+}
+
+# HTTPing 诊断后端
+run_httping_debug() {
+  local stats_file="$1"
+  local route_file="${2:-/dev/null}"
+  local debug_out="$RESULT_DIR/httping_debug.txt"
+  local raw_log="$RESULT_DIR/httping_raw.log"
+  local tmp_dir="$RESULT_DIR/httping_tmp"
+
+  mkdir -p "$tmp_dir"
+  rm -f "$tmp_dir"/* 2>/dev/null || true
+  local job_cnt=0
+
+  declare -A route_map_dict
+  if [ -s "$route_file" ]; then
+    while IFS='|' read -r status r_fam r_prov r_isp r_proto r_host r_label; do
+      if [ "$status" = "OK" ] && [ -n "$r_label" ]; then
+        route_map_dict["${r_fam}_${r_prov}_${r_isp}"]="$r_label"
+      fi
+    done < "$route_file"
+  fi
+
+  local targets_list
+  targets_list=$(awk -F'|' '$6 > 0 {
+    sent = $6; rcvd = $7; lat_sum = $8;
+    loss = (sent - rcvd) * 100 / sent;
+    if (rcvd > 0 && lat_sum > 0) lat = int(lat_sum / rcvd); else lat = 0;
+    
+    if (loss > 0 || rcvd == 0 || lat >= 350 || (rcvd > 0 && lat_sum == 0)) {
+      print $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" lat "|" int(loss) "|" rcvd
+    }
+  }' "$stats_file" 2>/dev/null)
+
+  [ -z "$targets_list" ] && return 0
+
+  while IFS='|' read -r family prov isp host ip lat loss rcvd; do
+    [ -z "$family" ] && continue
+    job_cnt=$((job_cnt + 1))
+    local out_item="$tmp_dir/item_${job_cnt}.txt"
+
+    local r_key="${family}_${prov}_${isp}"
+    local route_tag="${route_map_dict[$r_key]}"
+    local isp_with_route="$isp"
+    if [ -n "$route_tag" ] && [ "$route_tag" != "普通三网" ] && [ "$route_tag" != "普通线路" ]; then
+      isp_with_route="${isp}(${route_tag})"
+    fi
+
+    (
+      local port=80; [[ "$host" == *":443"* ]] && port=443
+      local ssl_arg=""
+      if [ "$port" = "443" ]; then ssl_arg="-l"; fi
+      
+      local clean_ip="$ip"
+      clean_ip="${clean_ip#'['}"
+      clean_ip="${clean_ip%']'}"
+      
+      local v_arg=""
+      if [ "$family" = "6" ] || [[ "$clean_ip" == *":"* ]]; then
+        v_arg="-6"
+      fi
+
+      if [ "$lat" -gt 10000 ]; then lat=0; fi
+
+      local http_timeout=6
+      if [ "$lat" -gt 0 ]; then
+        local l4_sec=$(( lat / 1000 ))
+        http_timeout=$(( l4_sec * 4 + 6 ))
+      fi
+
+      local raw_res
+      raw_res=$(httping $v_arg -c 2 -t "$http_timeout" $ssl_arg -s -h "$clean_ip" -p "$port" 2>&1 || true)
+
+      {
+        echo "============================================================"
+        echo "Time: $(date '+%Y-%m-%d %H:%M:%S') | Target: [IPv${family} ${prov} ${isp_with_route}] ${clean_ip}:${port}"
+        echo "Cmd: httping $v_arg -c 2 -t $http_timeout $ssl_arg -s -h $clean_ip -p $port"
+        echo "Raw Output:"
+        echo "$raw_res"
+        echo ""
+      } >> "$raw_log" 2>/dev/null || true
+
+      local ok_cnt
+      ok_cnt=$(echo "$raw_res" | awk -F',' '/connect\(s\)/ {for(i=1;i<=NF;i++) if($i ~ /ok/) {gsub(/[^0-9]/,"",$i); print $i}}')
+      [ -z "$ok_cnt" ] && ok_cnt=$(echo "$raw_res" | grep -c 'time=')
+      ok_cnt=${ok_cnt:-0}
+
+      local avg_rtt
+      avg_rtt=$(echo "$raw_res" | awk '
+        BEGIN { avg=0; count=0; sum=0; }
+        /round-trip|min\/avg\/max|avg\/min\/max/ {
+          if (match($0, /=[[:space:]]*[0-9.]+\/[0-9.]+\/[0-9.]+/)) {
+            str = substr($0, RSTART+1, RLENGTH-1);
+            gsub(/[[:space:]]/, "", str);
+            split(str, parts, "/");
+            if ($0 ~ /avg\/min\/max/) avg = parts[1];
+            else avg = parts[2];
+          }
+        }
+        /time=/ {
+          for (i=1; i<=NF; i++) {
+            if ($i ~ /^time=/) {
+              val = $i; gsub(/[^0-9.]/, "", val);
+              if (val > 0) { sum += val; count++; }
+            }
+          }
+        }
+        END {
+          if (avg > 0) printf "%.0f", avg;
+          else if (count > 0) printf "%.0f", sum / count;
+          else print "0";
+        }')
+      avg_rtt=${avg_rtt:-0}
+
+      if [ "$ok_cnt" -gt 0 ] && [ "$avg_rtt" -eq 0 ]; then
+        if [ "$lat" -gt 0 ]; then
+          avg_rtt=$lat
+        else
+          avg_rtt=50
+        fi
+      fi
+
+      local code
+      code=$(echo "$raw_res" | awk -F'status code ' '/status code/ {split($2, a, ","); print a[1]}' | tail -n1 | tr -d '()')
+      if [ -z "$code" ]; then
+        if [ "$ok_cnt" -gt 0 ]; then code="200 OK"
+        else
+          if echo "$raw_res" | grep -iqE 'reset|rst|econnreset'; then code="TCP_RST"
+          elif echo "$raw_res" | grep -iqE 'refused|econnrefused'; then code="REFUSED"
+          elif echo "$raw_res" | grep -iqE 'timeout|timed out|no response'; then code="TIMEOUT"
+          elif echo "$raw_res" | grep -iqE 'ssl|tls|certificate|handshake'; then code="SSL_ERR"
+          elif echo "$raw_res" | grep -iqE '403|forbidden'; then code="403 Forbidden"
+          elif echo "$raw_res" | grep -iqE '502|bad gateway'; then code="502 Bad Gateway"
+          else code="FAIL"; fi
+        fi
+      fi
+
+      local l4_str="${lat}ms"
+      [ "$rcvd" -eq 0 ] && l4_str="failed"
+      [ "$lat" -eq 0 ] && [ "$rcvd" -gt 0 ] && l4_str="N/A"
+
+      local is_slow=0
+      if [ "$avg_rtt" -ge 1000 ]; then
+        is_slow=1
+      elif [ "$avg_rtt" -ge 350 ] && [ "$lat" -gt 0 ] && [ "$avg_rtt" -ge $(( lat * 35 / 10 )) ]; then
+        is_slow=1
+      fi
+
+      # 🌟 修复与增强：统一写入 $11 真实延迟 lat，并统一 Tag
+      if [ "$ok_cnt" -gt 0 ]; then
+        if [ "$rcvd" -eq 0 ] || [ "$loss" -ge 50 ]; then
+          if [ "$ok_cnt" -eq 2 ]; then
+            printf "%s|%s|%s|%s|%s|%s|%s|%s|🛡️|探针误报 (SYN被高防拦截)|%s\n" "$family" "$prov" "$isp_with_route" "$l4_str" "$loss" "$ok_cnt" "$avg_rtt" "$code" "$lat" > "$out_item"
+          else
+            printf "%s|%s|%s|%s|%s|%s|%s|%s|⚠️|质差 (双层链路严重不稳定)|%s\n" "$family" "$prov" "$isp_with_route" "$l4_str" "$loss" "$ok_cnt" "$avg_rtt" "$code" "$lat" > "$out_item"
+          fi
+        elif [ "$ok_cnt" -lt 2 ]; then
+          printf "%s|%s|%s|%s|%s|%s|%s|%s|⚠️|质差 (应用层存在丢包/不稳定)|%s\n" "$family" "$prov" "$isp_with_route" "$l4_str" "$loss" "$ok_cnt" "$avg_rtt" "$code" "$lat" > "$out_item"
+        elif [ "$is_slow" -eq 1 ]; then
+          printf "%s|%s|%s|%s|%s|%s|%s|%s|🐢|体验卡顿 (首包重传)|%s\n" "$family" "$prov" "$isp_with_route" "$l4_str" "$loss" "$ok_cnt" "$avg_rtt" "$code" "$lat" > "$out_item"
+        else
+          printf "%s|%s|%s|%s|%s|%s|%s|%s|🔍|普通高延时复盘|%s\n" "$family" "$prov" "$isp_with_route" "$l4_str" "$loss" "$ok_cnt" "$avg_rtt" "$code" "$lat" > "$out_item"
+        fi
+      else
+        local diag_msg="确定故障 (节点断流)"
+        if [ "$code" = "TCP_RST" ]; then diag_msg="确定故障 (TCP RST 强行重置阻断)"
+        elif [ "$code" = "REFUSED" ]; then diag_msg="确定故障 (端口拒绝连接)"
+        elif [ "$code" = "TIMEOUT" ]; then diag_msg="确定故障 (L7 应用层响应超时)"; fi
+        printf "%s|%s|%s|%s|%s|0|0|%s|💀|%s|%s\n" "$family" "$prov" "$isp_with_route" "$l4_str" "$loss" "$code" "$diag_msg" "$lat" > "$out_item"
+      fi
+    ) &
+
+    if [ $((job_cnt % 4)) -eq 0 ]; then wait; fi
+  done <<< "$targets_list"
+
+  wait
+
+  cat "$tmp_dir"/item_*.txt 2>/dev/null | sort -t'|' -k1,1n -k2,2 > "$debug_out" || true
+  rm -rf "$tmp_dir"
+}
+
+# 🌟 改进方案一 + 三：按省份分块，并解析展示数学计算式
+render_httping_table() {
+  local debug_file="$1"
+  local target_family="${2:-}"
+  [ ! -s "$debug_file" ] && return 0
+
+  green="$GREEN" yellow="$YELLOW" red="$RED" cyan="$CYAN" white="$WHITE" dim="$DIM" bold="$BOLD" nc="$NC" el="$EL" tfam="$target_family" awk -F'|' '
+  BEGIN {
+    g_len = length("国");
+    green=ENVIRON["green"]; yellow=ENVIRON["yellow"]; red=ENVIRON["red"];
+    cyan=ENVIRON["cyan"]; white=ENVIRON["white"]; dim=ENVIRON["dim"];
+    bold=ENVIRON["bold"]; nc=ENVIRON["nc"]; el=ENVIRON["el"]; tfam=ENVIRON["tfam"];
+  }
+  function vwidth(str,    w, i, c) {
+    w = 0;
+    for (i = 1; i <= length(str); i++) {
+      c = substr(str, i, 1);
+      if (c ~ /[^\x00-\x7f]/) {
+        w += (g_len == 1) ? 2 : 2/3;
+      } else {
+        w += 1;
+      }
+    }
+    return int(w + 0.5);
+  }
+  function vpad(str, target_w,    w, pad) {
+    w = vwidth(str);
+    pad = target_w - w;
+    if (pad < 0) pad = 0;
+    return str sprintf("%*s", pad, "");
+  }
+  {
+    if (NF < 10 || $1 == "") next;
+    if (tfam != "" && $1 != tfam) next;
+
+    fam = "IPv" $1;
+    prov = $2;
+    isp_info = $3;
+    l4_info = $4 " (" int($5) "%)";
+    ok_cnt = $6;
+    l7_conn = (ok_cnt > 0) ? ok_cnt "/2 通" : "0/2 阻断";
+    rtt_val = $7;
+    code = $8;
+    tag = $9;
+    msg = $10;
+    lat = $11;
+
+    # 🌟 重传公式硬核拆解
+    if (rtt_val >= 1000) {
+        retrans_cnt = int((rtt_val - 200) / 1000);
+        if (retrans_cnt <= 0) retrans_cnt = 1;
+        penalty = retrans_cnt * 1000;
+        phy = rtt_val - penalty;
+        if (phy < 0) phy = lat;
+        if (phy == 0) phy = 50;
+        rtt_str = sprintf("%dms [ 真实%dms + %dms(%d次重传) ]", rtt_val, phy, penalty, retrans_cnt);
+    } else if (rtt_val > 0) {
+        rtt_str = sprintf("%dms [ 物理直连无重传 ]", rtt_val);
+    } else {
+        rtt_str = "TIMEOUT";
+    }
+
+    c = white;
+    if (tag == "🛡️") c = green;
+    else if (tag == "🐢" || tag == "⚠️") c = yellow;
+    else if (tag == "💀") c = red;
+    else c = cyan;
+
+    # 按照省份归类
+    if (!prov_seen[prov]) { prov_order[++prov_cnt] = prov; prov_seen[prov] = 1; }
+    
+    records[prov, ++rec_cnt[prov]] = sprintf("  %s %s %s L4: %s %s L7: %s %s RTT: %s %s %s%s %s%s",
+         vpad(fam, 5), vpad(isp_info, 14), dim "|" nc,
+         vpad(l4_info, 14), dim "|" nc,
+         vpad(l7_conn, 8), dim "|" nc,
+         vpad(rtt_str, 41), dim "|" nc,
+         c, tag, msg, nc);
+  }
+  END {
+    printf "  %s%s=== 🔍 触发条件节点 HTTPing L7 深度诊断 ===%s%s\n", bold, yellow, nc, el;
+    for (p = 1; p <= prov_cnt; p++) {
+        prov = prov_order[p];
+        printf "\n  %s%s[ %s ]%s\n", bold, cyan, prov, nc;
+        for (i = 1; i <= rec_cnt[prov]; i++) {
+            printf "%s\n", records[prov, i];
+        }
+    }
+    printf "\n";
+  }' "$debug_file"
+}
+
+redraw_dashboard() {
+  local snap_all="$RESULT_DIR/snap_all.txt"
+  cat "$RESULT_DIR"/stats_* > "$snap_all" 2>/dev/null || true
+
+  local has_v4=0; local has_v6=0
+  if grep -q "^4|" "$snap_all" 2>/dev/null; then has_v4=1; fi
+  if grep -q "^6|" "$snap_all" 2>/dev/null; then has_v6=1; fi
+
+  local view_mode="IPv4"
+  if [ "$has_v4" -eq 1 ] && [ "$has_v6" -eq 1 ]; then
+    if [ $((SECONDS / 6 % 2)) -eq 0 ]; then view_mode="IPv4"; else view_mode="IPv6"; fi
+  elif [ "$has_v6" -eq 1 ]; then view_mode="IPv6"; fi
+
+  printf "\033[H"
+  LAST_VIEW_MODE="$view_mode"
+  
+  local r_file="$RESULT_DIR/route_map.txt"
+  local r_status="${YELLOW}后台回程精准识别中 (请稍候...)${NC}"
+  if [ -s "$r_file" ]; then r_status="${GREEN}回程识别已就绪 (表格内已自动切换对应线路分类)${NC}"; else r_file="/dev/null"; fi
+  
+  local time_bar=""; local total_secs=$SECONDS
+  if [ "${TOTAL_TIMEOUT:-0}" -gt 0 ]; then
+    local remain=$(( TOTAL_TIMEOUT - total_secs )); [ "$remain" -lt 0 ] && remain=0
+    time_bar=" | ${YELLOW}自动关停倒计时: ${remain}秒${NC}"
+  else time_bar=" | ${GREEN}策略: 永续看盘模式${NC}"; fi
+
+  printf "%s%s\n" "${BOLD}${CYAN}TcpQuality Canvas 持续滚动监控监测脚本 v1.2.5 (部分重构版--计入首包数据)${NC}" "${EL}"
+  printf "%s%s\n" "${DIM}------------------------------------------------------------${NC}" "${EL}"
+  printf "报告时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST (北京时间)')%s\n" "${EL}"
+  printf "运行时间：${BOLD}${GREEN}已运行 ${total_secs}秒${NC}${time_bar}%s\n" "${EL}"
+  
+  local current_round=$(awk -F'|' 'BEGIN{s=0;n=0} {s+=$6; n++} END{if(n>0) print int(s/n)+1; else print 1}' "$snap_all")
+  printf "当前周期：${BOLD}${YELLOW}第 $current_round 轮全面盘点${NC} | 智能分时：${BOLD}${MAGENTA}${view_mode}${NC} 视图 (6秒轮切)%s\n" "${EL}"
+  printf "回程状态：${r_status}%s\n\n" "${EL}"
+  
+  local tfam="4"; [ "$view_mode" = "IPv6" ] && tfam="6"
+  local snap_view="$RESULT_DIR/snap_view.txt"
+  
+  grep "^${tfam}|" "$snap_all" | sort -t'|' -k2 > "$snap_view" 2>/dev/null || true
+  if [ -s "$snap_view" ]; then show_family_results "$view_mode" "$snap_view" "$tfam" "$r_file" ""; fi
+
+  printf "%s" "$ED"
+  rm -f "$snap_view" "$snap_all"
+}
+
+cleanup_all_processes() {
+  local exit_code=$?
+  trap - EXIT SIGINT SIGTERM 
+  set +e
+  local pids=$(jobs -p)
+  printf "\033[?1049l\033[?25h" 2>/dev/null || true
+
+  if [ -n "$pids" ]; then
+    exec 2>/dev/null
+    kill -9 $pids 2>/dev/null || true
+    wait $pids 2>/dev/null || true
+  fi
+
+  if [ "$exit_code" -ne 0 ] || [ "$SECONDS" -le 2 ]; then
+    rm -rf "$RESULT_DIR"
+    exit "$exit_code"
+  fi
+  
+  printf "%s" "$CLEAR"
+  local final_snap=$(mktemp)
+  cat "$RESULT_DIR"/stats_* > "$final_snap" 2>/dev/null || true
+  
+  local r_file="$RESULT_DIR/route_map.txt"
+  local r_status="${GREEN}回程识别已就绪 (静态复盘大盘)${NC}"
+  if [ ! -s "$r_file" ]; then r_status="${YELLOW}回程识别未完成${NC}"; r_file="/dev/null"; fi
+  
+  # 🌟 调整生命周期：先跑全量 L7 HTTPing，供主看板读取角标映射
+  if [ ! -s "$RESULT_DIR/httping_debug.txt" ]; then
+    printf "\n  %s⏰ %s正在进行最终全量 L7 HTTPing 交叉核实 (后台轮询已终止，资源全量倾斜)...%s\n" "${BOLD}" "${YELLOW}" "${NC}"
+    run_httping_debug "$final_snap" "$r_file" 2>/dev/null || true
+  fi
+  local httping_file="$RESULT_DIR/httping_debug.txt"
+
+  local total_secs=$SECONDS
+  local current_round=$(awk -F'|' 'BEGIN{s=0;n=0} {s+=$6; n++} END{if(n>0) print int(s/n)+1; else print 1}' "$final_snap")
+
+  printf "%s\n" "${BOLD}${CYAN}TcpQuality Canvas 持续滚动监控监测脚本 v1.2.5 (部分重构版--计入首包数据)${NC}"
+  printf "%s\n" "${DIM}------------------------------------------------------------${NC}"
+  printf "报告时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST (北京时间)')\n"
+  printf "运行时间：${BOLD}${GREEN}已运行 ${total_secs}秒${NC} | ${GREEN}策略: 触发设定时限，安全关停停机${NC}\n"
+  printf "当前周期：${BOLD}${YELLOW}第 $current_round 轮全面盘点${NC}\n"
+  printf "回程状态：${r_status}\n\n"
+
+  if grep -q "^4|" "$final_snap" 2>/dev/null; then
+    local snap_view4=$(mktemp)
+    grep "^4|" "$final_snap" | sort -t'|' -k2 > "$snap_view4" 2>/dev/null || true
+    # 传入 httping_file 给主大盘绘制角标
+    show_family_results "IPv4" "$snap_view4" "4" "$r_file" "$httping_file"
+    rm -f "$snap_view4"
+  fi
+
+  if grep -q "^6|" "$final_snap" 2>/dev/null; then
+    printf "\n%s\n" "${BOLD}${CYAN}------------------------------- IPv6 简洁延伸视图 -------------------------------${NC}"
+    local snap_view6=$(mktemp)
+    grep "^6|" "$final_snap" | sort -t'|' -k2 > "$snap_view6" 2>/dev/null || true
+    show_family_results "IPv6" "$snap_view6" "6" "$r_file" "$httping_file"
+    rm -f "$snap_view6"
+  fi
+
+  # 🌟 渲染重组后的块级分组诊断表
+  if [ -s "$httping_file" ]; then
+    render_httping_table "$httping_file" ""
+  fi
+
+  printf "\n%s\n" "${BOLD}${MAGENTA}=== 监测任务结束，当前全网历史累计监测静态大表已就绪 ===${NC}"
+  printf "%s💡 调试日志与 HTTPing 原始返回文本已保存在: %s%s\n\n" "${DIM}" "$RESULT_DIR" "${NC}"
+
+  rm -f "$final_snap"
+  exit 0
+}
+
+trap cleanup_all_processes EXIT SIGINT SIGTERM
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -v4|--v4) ONLY_IPV4=1; shift ;;
+      -v6|--v6) ONLY_IPV6=1; shift ;;
+      -t|--time) TOTAL_TIMEOUT="$2"; shift 2 ;;
+      --province) add_province_filter "$2"; shift 2 ;;
+      -??|-???) if add_province_filter "$1"; then shift; else shift; fi ;;
+      *) shift ;;
+    esac
+  done
+}
+
+# ===================== 💎 【主入口】 =====================
+main() {
+  check_and_install_deps
+  detect_hardware_basics
+  parse_args "$@"
+  detect_ip_stack
+  
+  echo -e "${CYAN}[i] 正在获取远端监测节点列表中...${NC}"
+  if ! load_remote_nodes; then
+    echo -e "${RED}[X] 错误：无法从 API 接口获取节点列表，请检查网络连接或 DNS！${NC}"
+    exit 1
+  fi
+
+  local ipv4_enabled=0; local ipv6_enabled=0
+  if [ "$ONLY_IPV6" -ne 1 ] && ipv4_available; then ipv4_enabled=1; fi
+  if [ "$ONLY_IPV4" -ne 1 ] && ipv6_available; then ipv6_enabled=1; fi
+
+  local dashboard_refresh=1
+  if [ "${TOTAL_TIMEOUT:-120}" -eq 0 ]; then 
+    dashboard_refresh=2  
+    if [ "$PING_INTERVAL" -eq 1 ]; then PING_INTERVAL=3; fi
+  fi
+
+  NODES_QUEUE=()
+  local -a families=()
+  [ "$ipv4_enabled" -eq 1 ] && families+=(4)
+  [ "$ipv6_enabled" -eq 1 ] && families+=(6)
+
+  for family in "${families[@]}"; do
+    local -a raw_nodes=()
+    if [ "$family" = "6" ]; then raw_nodes=("${REMOTE_CDN6_NODES[@]}")
+    else raw_nodes=("${REMOTE_CDN4_NODES[@]}"); fi
+
+    for entry in "${raw_nodes[@]}"; do
+      [ -z "$entry" ] && continue
+      IFS='|' read -r prov isp host fixed_ip port backup_host backup_ip backup_port <<< "$entry"
+      province_selected "$prov" || continue
+      local final_port=${port:-$DEFAULT_PORT}
+      [ "$DEFAULT_PORT" = "80" ] && [ "$port" = "80" ] && final_port="80"
+      NODES_QUEUE+=("$family|$prov|$isp|$host|$fixed_ip|$final_port|$backup_host|$backup_ip|${backup_port:-80}")
+    done
+  done
+
+  if [ ${#NODES_QUEUE[@]} -eq 0 ]; then echo -e "${RED}[X] 错误：未在当前网络环境下匹配到可用节点。${NC}"; exit 1; fi
+
+  local limit_jobs=$(echo "${MAX_PREWARM_JOBS:-10}" | tr -cd '0-9'); limit_jobs=${limit_jobs:-10}
+  echo -e "${CYAN}[i] 正在执行多线程节点可用性预检筛选 (限制并发数: ${limit_jobs})...${NC}"
+  
+  for node_entry in "${NODES_QUEUE[@]}"; do
+    local current_jobs=$(jobs -pr | wc -l | tr -cd '0-9'); current_jobs=${current_jobs:-0}
+    while [ "${current_jobs:-0}" -ge "$limit_jobs" ]; do
+      local done_cnt=$(find "$RESULT_DIR" -maxdepth 1 -name "pre_done_*" 2>/dev/null | wc -l | tr -cd '0-9')
+      echo -ne "\r  -> 正在构建活节点白名单及本地快照... (${done_cnt:-0}/${#NODES_QUEUE[@]})"
+      sleep 0.05
+      current_jobs=$(jobs -pr | wc -l | tr -cd '0-9'); current_jobs=${current_jobs:-0}
+    done
+
+    IFS='|' read -r family prov isp host fixed_ip port rest <<< "$node_entry"
+    local k="${family}_${prov}_${isp}"
+    
+    (
+      trap 'touch "$RESULT_DIR/pre_done_${k}"' EXIT
+      IFS='|' read -r family prov isp host fixed_ip port b_host b_ip b_port <<< "$node_entry"
+      
+      local clean_ip="$fixed_ip"
+      clean_ip="${clean_ip#'['}"
+      clean_ip="${clean_ip%']'}"
+      
+      local mode_arg=""
+      if [ "$NC_SUPPORTS_FAMILY_FLAGS" -eq 1 ]; then
+        mode_arg="-4"; [ "$family" = "6" ] && mode_arg="-6"
+      fi
+
+      local t_start=$EPOCHREALTIME
+      if nc $mode_arg -n -w 2 -zv "$clean_ip" "$port" &>/dev/null; then
+        local t_end=$EPOCHREALTIME
+        local s1=${t_start%.*}; local f1=${t_start#*.}
+        local s2=${t_end%.*};   local f2=${t_end#*.}
+        f1="${f1}000"; f1=${f1:0:3}
+        f2="${f2}000"; f2=${f2:0:3}
+        local int_rtt=$(( (10#$s2 - 10#$s1) * 1000 + 10#$f2 - 10#$f1 ))
+        [ "$int_rtt" -le 0 ] && int_rtt=1
+
+        echo "$family|$prov|$isp|$host|$clean_ip|$port" > "$RESULT_DIR/pre_alive_${k}"
+        
+        if [ "$int_rtt" -ge 800 ]; then
+          echo "$family|$prov|$isp|$host|$clean_ip|1|0|120" > "$RESULT_DIR/pre_res_${k}"
+        else
+          echo "$family|$prov|$isp|$host|$clean_ip|1|1|$int_rtt" > "$RESULT_DIR/pre_res_${k}"
+        fi
+        exit 0
+      fi
+    ) 2>/dev/null &
+    sleep 0.05 
+  done
+
+  local current_jobs=$(jobs -pr | wc -l | tr -cd '0-9'); current_jobs=${current_jobs:-0}
+  while [ "${current_jobs:-0}" -gt 0 ]; do
+    local done_cnt=$(find "$RESULT_DIR" -maxdepth 1 -name "pre_done_*" 2>/dev/null | wc -l | tr -cd '0-9')
+    echo -ne "\r  -> 正在构建活节点白名单及本地快照... (${done_cnt:-0}/${#NODES_QUEUE[@]})"
+    sleep 0.05
+    current_jobs=$(jobs -pr | wc -l | tr -cd '0-9'); current_jobs=${current_jobs:-0}
+  done; wait
+
+  POLL_QUEUE=()
+  for node_entry in "${NODES_QUEUE[@]}"; do
+    IFS='|' read -r family prov isp rest <<< "$node_entry"
+    local k="${family}_${prov}_${isp}"
+    if [ -f "$RESULT_DIR/pre_alive_${k}" ]; then POLL_QUEUE+=("$(cat "$RESULT_DIR/pre_alive_${k}")"); fi
+  done
+
+  local total_alive_nodes=${#POLL_QUEUE[@]}
+  if [ "$total_alive_nodes" -eq 0 ]; then echo -e "\n${RED}[X] 预检失败：存活可用监测节点为 0！${NC}"; exit 1; fi
+  
+  if [ "$DETECTED_CPU_CORES" -le 1 ]; then
+    if [ "$total_alive_nodes" -gt 100 ]; then PACING_ADDER=4
+    elif [ "$total_alive_nodes" -gt 50 ]; then PACING_ADDER=2
+    else PACING_ADDER=0; fi
+    sleep 1
+  else PACING_ADDER=0; fi
+
+  printf "\033[?1049h\033[?25l\033[H" 2>/dev/null || true
+  printf "%s" "$CLEAR"
+  run_bg_route_detection 2>/dev/null &
+  
+  local pre_idx=0
+  for node_entry in "${POLL_QUEUE[@]}"; do
+    pre_idx=$((pre_idx + 1))
+    (
+      set +e
+      IFS='|' read -r family prov isp host fixed_ip port <<< "$node_entry"
+      local stat_file="$RESULT_DIR/stats_${family}_${prov}_${isp}"
+      local res_file="$RESULT_DIR/pre_res_${family}_${prov}_${isp}"
+      
+      local mode_arg=""
+      if [ "$NC_SUPPORTS_FAMILY_FLAGS" -eq 1 ]; then
+        mode_arg="-4"; [ "$family" = "6" ] && mode_arg="-6"
+      fi
+
+      local clean_ip="$fixed_ip"
+      clean_ip="${clean_ip#'['}"
+      clean_ip="${clean_ip%']'}"
+      local timeout_sec=2
+
+      local s_sent=1; local s_rcvd=1; local current_avg=130
+      if [ -f "$res_file" ]; then
+        local pre_content=$(cat "$res_file")
+        IFS='|' read -r _ _ _ _ _ pre_sent pre_rcvd pre_lat <<< "$pre_content"
+        [ -n "$pre_sent" ] && s_sent=$pre_sent
+        [ -n "$pre_rcvd" ] && s_rcvd=$pre_rcvd
+        [ -n "$pre_lat" ]  && current_avg=$pre_lat
+      fi
+      if [ "$current_avg" -gt 200 ]; then current_avg=120; fi
+
+      local s_lat_sum=$(( current_avg * s_rcvd ))
+      echo "$family|$prov|$isp|$host|$clean_ip|$s_sent|$s_rcvd|$s_lat_sum" > "$stat_file"
+
+      sleep "$(awk -v idx="$pre_idx" 'BEGIN { printf "%.2f", (idx % 30) * 0.15 }')"
+      
+      local last_rtt=0
+      while true; do
+        local base_interval=$PING_INTERVAL
+        if [ "$isp" = "电信" ]; then base_interval=$(( PING_INTERVAL + 2 ))
+        elif [ "$isp" = "联通" ]; then base_interval=$(( PING_INTERVAL - 1 ))
+        else base_interval=$PING_INTERVAL; fi
+
+        local actual_interval=$(( base_interval + PACING_ADDER ))
+        local max_limit=${MAX_NODE_INTERVAL:-8}
+        if [ "$actual_interval" -gt "$max_limit" ]; then actual_interval=$max_limit; fi
+
+        local penalty_backoff=0
+        if [ "$last_rtt" -ge 800 ]; then penalty_backoff=2; fi
+
+        sleep "$(( actual_interval + penalty_backoff )).$(( RANDOM % 90 + 10 ))"
+        
+        s_sent=$((s_sent + 1))
+        local t_start=$EPOCHREALTIME
+        
+        if nc $mode_arg -n -w $timeout_sec -zv "$clean_ip" "$port" &>/dev/null; then
+            local t_end=$EPOCHREALTIME
+            local s1=${t_start%.*}; local f1=${t_start#*.}
+            local s2=${t_end%.*};   local f2=${t_end#*.}
+            
+            f1="${f1}000"; f1=${f1:0:3}
+            f2="${f2}000"; f2=${f2:0:3}
+            
+            local int_rtt=$(( (10#$s2 - 10#$s1) * 1000 + 10#$f2 - 10#$f1 ))
+            [ "$int_rtt" -le 0 ] && int_rtt=1
+            last_rtt=$int_rtt
+
+            if [ "$int_rtt" -ge 800 ]; then
+                last_rtt=800
+            else
+                s_rcvd=$((s_rcvd + 1))
+                if [ "$current_avg" -eq 0 ]; then current_avg=$int_rtt
+                else current_avg=$(( (current_avg * 7 + int_rtt * 3) / 10 )); fi
+                s_lat_sum=$((current_avg * s_rcvd))
+            fi
+        else
+            last_rtt=2000
+        fi
+
+        echo "$family|$prov|$isp|$host|$clean_ip|$s_sent|$s_rcvd|$s_lat_sum" > "$stat_file"
+      done
+    ) 2>/dev/null &
+  done
+
+  while true; do
+    redraw_dashboard
+    if [ "${TOTAL_TIMEOUT:-0}" -gt 0 ] && [ "${SECONDS:-0}" -ge "${TOTAL_TIMEOUT:-0}" ]; then
+      cleanup_all_processes
+    fi
+    sleep "$dashboard_refresh"
+  done
+}
+
+main "$@"
